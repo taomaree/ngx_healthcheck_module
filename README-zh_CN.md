@@ -46,6 +46,18 @@ Table of Contents
 - 七层支持的检测类型：http / fastcgi
 - 提供一个统一的http状态查询接口，输出格式：html / json / csv
 
+制作patch
+============
+如果patch文件夹下没有对应nginx版本patch或者需要基于定制化版本的nginx制作patch,可以通过下述步骤快速制作:
+```
+1 git clone https://github.com/nginx/nginx.git or customized nginx repo
+2 cd nginx or customized nginx directory
+3 git checkout branches/stable-x.y.z(目标版本)
+4 adjust nginx source code according to other version patch, eg : ngx_healthcheck_for_nginx_1.26+.patch
+5 git diff * > ngx_healthcheck_for_nginx_x.y+.patch 
+6 upload this patch to this repo if you want
+```
+
 如何安装
 ============
 
