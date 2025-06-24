@@ -549,7 +549,7 @@ static ngx_check_conf_t  ngx_check_types[] = {
       NULL,
       NULL,
       0,
-      1 },
+      0 },
 
     { NGX_HTTP_CHECK_HTTP,
       ngx_string("http"),
@@ -1409,7 +1409,7 @@ ngx_http_upstream_check_http_init(ngx_upstream_check_peer_t *peer)
     return NGX_OK;
 }
 
-ngx_int_t
+static ngx_int_t
 ngx_http_upstream_check_http_parse(ngx_upstream_check_peer_t *peer)
 {
     ngx_int_t                            rc;
