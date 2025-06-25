@@ -50,8 +50,6 @@ typedef struct {
 #define NGX_HTTP_CHECK_SEND_DONE             0x0002
 #define NGX_HTTP_CHECK_RECV_DONE             0x0004
 #define NGX_HTTP_CHECK_ALL_DONE              0x0008
-#define NGX_HTTP_CHECK_SSL_HANDSHAKE_DONE    0x0010
-
 
 
 #define NGX_CHECK_TYPE_TCP                   0x0001
@@ -137,14 +135,6 @@ static ngx_int_t ngx_stream_upstream_check_ssl_hello_parse(
 static void ngx_stream_upstream_check_ssl_hello_reinit(
         ngx_upstream_check_peer_t *peer);
 
-static ngx_int_t ngx_stream_upstream_check_https_init(
-        ngx_upstream_check_peer_t *peer);
-static ngx_int_t ngx_stream_upstream_check_https_parse(
-        ngx_upstream_check_peer_t *peer);
-static void ngx_stream_upstream_check_https_reinit(
-        ngx_upstream_check_peer_t *peer);
-static void ngx_stream_upstream_check_https_send_handler(ngx_event_t *event);
-static void ngx_stream_upstream_check_https_recv_handler(ngx_event_t *event);
 static void ngx_stream_upstream_check_ssl_connect_handler(ngx_event_t *event);
 static void ngx_stream_upstream_check_ssl_handshake_handler(ngx_connection_t *c);
 
@@ -376,11 +366,11 @@ static ngx_check_conf_t  ngx_check_types[] = {
                 ngx_string("https"),
                 ngx_string("GET / HTTP/1.0\r\n\r\n"),
                 NGX_CONF_BITMASK_SET | NGX_CHECK_HTTP_2XX | NGX_CHECK_HTTP_3XX,
-                ngx_stream_upstream_check_https_send_handler,
-                ngx_stream_upstream_check_https_recv_handler,
-                ngx_stream_upstream_check_https_init,
-                ngx_stream_upstream_check_https_parse,
-                ngx_stream_upstream_check_https_reinit,
+                ngx_stream_upstream_check_send_handler,
+                ngx_stream_upstream_check_recv_handler,
+                ngx_stream_upstream_check_http_init,
+                ngx_stream_upstream_check_http_parse,
+                ngx_stream_upstream_check_http_reinit,
                 1,
                 1 },
         { NGX_CHECK_TYPE_SSL_HELLO,
@@ -933,7 +923,7 @@ ngx_stream_upstream_check_ssl_connect_handler(ngx_event_t *event)
     if (rc == NGX_OK) {
         c->write->handler = peer->send_handler;
         c->read->handler = peer->recv_handler;
-        c->write->handler(c->write); //zhoucx: it is check_type->send_handler.
+        c->write->handler(c->write); 
     }
 }
 
@@ -941,11 +931,9 @@ static void
 ngx_stream_upstream_check_ssl_handshake_handler(ngx_connection_t *c)
 {
     if (c->ssl->handshaked) {
-        //peer->state = NGX_HTTP_CHECK_SSL_HANDSHAKE_DONE;
-        c->write->handler = ngx_stream_upstream_check_https_send_handler;
-        c->read->handler = ngx_stream_upstream_check_https_recv_handler;
-        /* The kqueue's loop interface needs it. */
-        c->write->handler(c->write); //zhoucx: it is check_type->send_handler.
+        c->write->handler = ngx_stream_upstream_check_send_handler;
+        c->read->handler = ngx_stream_upstream_check_recv_handler;
+        c->write->handler(c->write); 
     }
 }   
 
@@ -1062,6 +1050,7 @@ ngx_stream_upstream_check_send_handler(ngx_event_t *event)
     ngx_connection_t               *c;
     ngx_stream_upstream_check_ctx_t  *ctx;
     ngx_upstream_check_peer_t *peer;
+    ngx_upstream_check_srv_conf_t  *ucscf;
 
     if (ngx_stream_upstream_check_need_exit()) {
         return;
@@ -1069,6 +1058,7 @@ ngx_stream_upstream_check_send_handler(ngx_event_t *event)
 
     c = event->data;
     peer = c->data;
+    ucscf = peer->conf;
 
     ngx_log_debug(LOG_LEVEL, c->log, 0, MODULE_NAME
                      "[send-handler] for peer:%V",
@@ -1095,6 +1085,18 @@ ngx_stream_upstream_check_send_handler(ngx_event_t *event)
         return; // (changxun): wait future connect event.
     }
 
+    if (ucscf->check_type_conf->type == NGX_CHECK_TYPE_HTTPS) {
+        // handshaked = 1 (done)
+        if (!c->ssl->handshaked) {
+            if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
+                ngx_log_error(NGX_LOG_ERR, c->log, 0, MODULE_NAME
+                            "check handle ssl connect write event error with peer: %V ",
+                            &peer->check_peer_addr->name);
+                goto check_send_fail;
+            }
+            return;
+        }
+    }
     if (peer->check_data == NULL) {
 
         peer->check_data = ngx_pcalloc(peer->pool,
@@ -2502,395 +2504,4 @@ ngx_stream_upstream_check_init_process(ngx_cycle_t *cycle)
 
     return ngx_stream_upstream_check_add_timers(cycle);
 }
-
-
-/* HTTPS health check functions */
-static ngx_int_t
-ngx_stream_upstream_check_https_init(ngx_upstream_check_peer_t *peer)
-{
-    ngx_stream_upstream_check_ctx_t       *ctx;
-    ngx_upstream_check_srv_conf_t  *ucscf;
-
-    ctx = peer->check_data;
-    ucscf = peer->conf;
-
-    ctx->send.start = ctx->send.pos = (u_char *)ucscf->send.data;
-    ctx->send.end = ctx->send.last = ctx->send.start + ucscf->send.len;
-
-    ctx->recv.start = ctx->recv.pos = ctx->recv.last = ctx->recv.end = NULL;
-
-    ctx->state = 0;
-
-    ngx_memzero(&ctx->status, sizeof(ngx_http_status_t));
-
-    return NGX_OK;
-}
-
-
-static ngx_int_t
-ngx_stream_upstream_check_https_parse(ngx_upstream_check_peer_t *peer)
-{
-    ngx_int_t                        rc;
-    ngx_uint_t                       code, code_n;
-    ngx_stream_upstream_check_ctx_t *ctx;
-    ngx_upstream_check_srv_conf_t   *ucscf;
-
-    ucscf = peer->conf;
-    ctx = peer->check_data;
-
-    if ((ctx->recv.last - ctx->recv.pos) > 0) {
-
-        rc = ngx_upstream_check_http_parse_status_line(&ctx->recv,
-                                                       &ctx->state,
-                                                       &ctx->status);
-        if (rc == NGX_AGAIN) {
-            return rc;
-        }
-
-        if (rc == NGX_ERROR) {
-            ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0, MODULE_NAME
-                          "https parse status line error with peer: %V ",
-                          &peer->check_peer_addr->name);
-            return rc;
-        }
-
-        code = ctx->status.code;
-
-        if (code >= 200 && code < 300) {
-            code_n = NGX_CHECK_HTTP_2XX;
-        } else if (code >= 300 && code < 400) {
-            code_n = NGX_CHECK_HTTP_3XX;
-        } else if (code >= 400 && code < 500) {
-            peer->pc.connection->error = 1;
-            code_n = NGX_CHECK_HTTP_4XX;
-        } else if (code >= 500 && code < 600) {
-            peer->pc.connection->error = 1;
-            code_n = NGX_CHECK_HTTP_5XX;
-        } else {
-            peer->pc.connection->error = 1;
-            code_n = NGX_CHECK_HTTP_ERR;
-        }
-
-        /* find content length from [Content-Length: (\d+)\r] */
-        *ctx->status.end = '\0';
-        u_char * content_len_start = (u_char *)ngx_strstr(ctx->status.start, "Content-Length:");
-        u_char * content_len_end = NULL;
-        ngx_uint_t found_body_len = 0, body_len = 0;
-        if (content_len_start != NULL) {
-            content_len_end = ngx_strlchr(content_len_start, ctx->status.end, '\r');
-            if (content_len_end != NULL) {
-                found_body_len = 1;
-                ngx_str_t content_len_line = {content_len_end-content_len_start, content_len_start};
-                body_len = ngx_atoi(content_len_line.data + sizeof("Content-Length: ")-1,
-                                    content_len_line.len - (sizeof("Content-Length: ")-1));
-                ngx_log_error(NGX_LOG_INFO, ngx_cycle->log, 0, MODULE_NAME
-                              "[https-response-parse]: found content-length: [%V],value: %ui",
-                              &content_len_line, body_len);
-            }
-        }
-
-        ngx_str_t response_body = {ctx->recv.last - ctx->recv.pos, ctx->recv.pos};
-
-        ngx_log_debug(LOG_LEVEL, ngx_cycle->log, 0, MODULE_NAME
-                "[https-response-parse]: "
-                "code: %ui, expect code mask: %ui. "
-                "received body len: %ui, content:[%V]",
-                code, ucscf->code.status_alive,
-                response_body.len, &response_body);
-
-        if (!(code_n & ucscf->code.status_alive)) {
-            ngx_log_debug(LOG_LEVEL, ngx_cycle->log, 0, MODULE_NAME
-                          "[https-response-parse]: code not matched");
-            return NGX_ERROR;
-        } else if (ucscf->expect_body_regex != NGX_CONF_UNSET_PTR) {
-            if (found_body_len == 1 && response_body.len < body_len) {
-                return NGX_AGAIN;
-            }
-            /* body check */
-            ngx_int_t n;
-            n = ngx_regex_exec(ucscf->expect_body_regex, &response_body, NULL, 0);
-            if (n == NGX_REGEX_NO_MATCHED) {
-                if (found_body_len == 1) {
-                    ngx_log_debug(LOG_LEVEL, ngx_cycle->log, 0, MODULE_NAME
-                                  "[https-response-parse]: body not matched");
-                    return NGX_ERROR;
-                } else {
-                    /* we don't known the end flag, so we have to wait next match util timeout */
-                    return NGX_AGAIN;
-                }
-            } else {
-                ngx_log_debug(LOG_LEVEL, ngx_cycle->log, 0, MODULE_NAME
-                              "[https-response-parse]: body matched");
-                return NGX_OK;
-            }
-        } else {
-            ngx_log_debug(LOG_LEVEL, ngx_cycle->log, 0, MODULE_NAME
-                          "[https-response-parse]: code matched");
-            return NGX_OK;
-        }
-    } else {
-        return NGX_AGAIN;
-    }
-
-    return NGX_OK;
-}
-
-
-static void
-ngx_stream_upstream_check_https_reinit(ngx_upstream_check_peer_t *peer)
-{
-    ngx_stream_upstream_check_ctx_t  *ctx;
-
-    ctx = peer->check_data;
-
-    ctx->send.pos = ctx->send.start;
-    ctx->send.last = ctx->send.end;
-
-    ctx->recv.pos = ctx->recv.last = ctx->recv.start;
-
-    ctx->state = 0;
-
-    ngx_memzero(&ctx->status, sizeof(ngx_http_status_t));
-}
-
-
-static void
-ngx_stream_upstream_check_https_send_handler(ngx_event_t *event)
-{
-    ssize_t                         size;
-    ngx_connection_t               *c;
-    ngx_stream_upstream_check_ctx_t  *ctx;
-    ngx_upstream_check_peer_t *peer;
-
-    if (ngx_stream_upstream_check_need_exit()) {
-        return;
-    }
-
-    c = event->data;
-    peer = c->data;
-
-    ngx_log_debug(LOG_LEVEL, c->log, 0, MODULE_NAME
-                     "[https-send-handler] for peer:%V",
-                     &peer->check_peer_addr->name);
-
-    if (c->pool == NULL) {
-        ngx_log_error(NGX_LOG_ERR, event->log, 0, MODULE_NAME
-                      "check pool NULL with peer: %V ",
-                      &peer->check_peer_addr->name);
-
-        goto check_https_send_fail;
-    }
-
-    if (peer->state != NGX_HTTP_CHECK_CONNECT_DONE) {
-        if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
-            ngx_log_error(NGX_LOG_ERR, c->log, 0, MODULE_NAME
-                          "check handle connect write event error with peer: %V ",
-                          &peer->check_peer_addr->name);
-            goto check_https_send_fail;
-        }
-
-        return;
-    }
-
-    if (!c->ssl->handshaked) {
-        if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
-            ngx_log_error(NGX_LOG_ERR, c->log, 0, MODULE_NAME
-                          "check handle ssl connect write event error with peer: %V ",
-                          &peer->check_peer_addr->name);
-            goto check_https_send_fail;
-        }
-
-        return;
-    }
-
-    if (peer->check_data == NULL) {
-
-        peer->check_data = ngx_pcalloc(peer->pool,
-                                       sizeof(ngx_stream_upstream_check_ctx_t));
-        if (peer->check_data == NULL) {
-            goto check_https_send_fail;
-        }
-
-        if (peer->init == NULL || peer->init(peer) != NGX_OK) {
-
-            ngx_log_error(NGX_LOG_ERR, c->log, 0, MODULE_NAME
-                          "check init error with peer: %V ",
-                          &peer->check_peer_addr->name);
-
-            goto check_https_send_fail;
-        }
-    }
-
-    ctx = peer->check_data;
-
-    while (ctx->send.pos < ctx->send.last) {
-
-        size = c->send(c, ctx->send.pos, ctx->send.last - ctx->send.pos);
-
-#if (NGX_DEBUG)
-        {
-        ngx_err_t  err;
-
-        err = (size >=0) ? 0 : ngx_socket_errno;
-        ngx_log_debug2(LOG_LEVEL, c->log, err,
-                       "stream check https send size: %z, total: %z",
-                       size, ctx->send.last - ctx->send.start);
-        }
-#endif
-
-        if (size > 0) {
-            ctx->send.pos += size;
-        } else if (size == 0 || size == NGX_AGAIN) {
-            return;
-        } else {
-            c->error = 1;
-            goto check_https_send_fail;
-        }
-    }
-
-    if (ctx->send.pos == ctx->send.last) {
-        ngx_log_debug0(LOG_LEVEL, c->log, 0, "stream check https send done.");
-        peer->state = NGX_HTTP_CHECK_SEND_DONE;
-        c->requests++;
-    }
-
-    return;
-
-check_https_send_fail:
-    ngx_stream_upstream_check_status_update(peer, 0);
-    ngx_stream_upstream_check_clean_event(peer);
-}
-
-
-static void
-ngx_stream_upstream_check_https_recv_handler(ngx_event_t *event)
-{
-    u_char                          *new_buf;
-    ssize_t                          size, n;
-    ngx_int_t                        rc;
-    ngx_connection_t                *c;
-    ngx_stream_upstream_check_ctx_t *ctx;
-    ngx_upstream_check_peer_t  *peer;
-
-    if (ngx_stream_upstream_check_need_exit()) {
-        return;
-    }
-
-    c = event->data;
-    peer = c->data;
-
-    if (peer->state != NGX_HTTP_CHECK_SEND_DONE) {
-
-        if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
-            goto check_https_recv_fail;
-        }
-
-        return;
-    }
-
-    ctx = peer->check_data;
-
-    if (ctx->recv.start == NULL) {
-        /* 1/2 of a page_size, is it enough? */
-        ctx->recv.start = ngx_pcalloc(peer->pool, ngx_pagesize / 2);
-        if (ctx->recv.start == NULL) {
-            goto check_https_recv_fail;
-        }
-
-        ctx->recv.last = ctx->recv.pos = ctx->recv.start;
-        ctx->recv.end = ctx->recv.start + ngx_pagesize / 2 ;
-    }
-
-    while (1) {
-        n = ctx->recv.end - ctx->recv.last;
-
-        /* buffer not big enough? enlarge it by twice */
-        if (n == 0) {
-            size = ctx->recv.end - ctx->recv.start;
-            new_buf = ngx_pcalloc(peer->pool, size * 2);
-            if (new_buf == NULL) {
-                goto check_https_recv_fail;
-            }
-
-            ngx_memcpy(new_buf, ctx->recv.start, size);
-
-            ctx->recv.pos = new_buf + (ctx->recv.pos - ctx->recv.start);
-            ctx->recv.last = new_buf + (ctx->recv.last - ctx->recv.start);
-            ctx->recv.start = new_buf;
-            ctx->recv.end = new_buf + size * 2;
-
-            n = ctx->recv.end - ctx->recv.last;
-        }
-
-        size = c->recv(c, ctx->recv.last, n);
-
-#if (NGX_DEBUG)
-        {
-        ngx_err_t  err;
-
-        err = (size >= 0) ? 0 : ngx_socket_errno;
-        ngx_log_debug2(LOG_LEVEL, c->log, err,
-                       "stream check https recv size: %z, peer: %V ",
-                       size, &peer->check_peer_addr->name);
-        }
-#endif
-
-        if (size > 0) {
-            ctx->recv.last += size;
-            continue;
-        } else if (size == 0 || size == NGX_AGAIN) {
-            break;
-        } else {
-            c->error = 1;
-            goto check_https_recv_fail;
-        }
-    }
-
-    rc = peer->parse(peer);
-
-    ngx_log_debug2(LOG_LEVEL, c->log, 0,
-                   "stream check https parse rc: %i, peer: %V ",
-                   rc, &peer->check_peer_addr->name);
-
-    switch (rc) {
-
-    case NGX_OK:
-        ngx_stream_upstream_check_status_update(peer, 1);
-        break;
-
-    case NGX_ERROR:
-        ngx_log_error(NGX_LOG_ERR, c->log, 0,
-                      "check protocol %V error with peer: %V ",
-                      &peer->conf->check_type_conf->name,
-                      &peer->check_peer_addr->name);
-
-        ngx_stream_upstream_check_status_update(peer, 0);
-        break;
-
-    case NGX_AGAIN:
-        /* The peer has closed its half side of the connection. */
-        if (size == 0) {
-            ngx_stream_upstream_check_status_update(peer, 0);
-            break;
-        }
-
-        return;
-
-    default:
-        ngx_log_error(NGX_LOG_ERR, c->log, 0,
-                      "check protocol %V returns %i",
-                      &peer->conf->check_type_conf->name, rc);
-        goto check_https_recv_fail;
-    }
-
-    peer->state = NGX_HTTP_CHECK_RECV_DONE;
-    ngx_stream_upstream_check_clean_event(peer);
-    return;
-
-check_https_recv_fail:
-    ngx_stream_upstream_check_status_update(peer, 0);
-    ngx_stream_upstream_check_clean_event(peer);
-}
-
-
 
