@@ -549,7 +549,7 @@ static ngx_check_conf_t  ngx_check_types[] = {
       NULL,
       NULL,
       0,
-      1 },
+      0 },
 
     { NGX_HTTP_CHECK_HTTP,
       ngx_string("http"),
@@ -1409,7 +1409,7 @@ ngx_http_upstream_check_http_init(ngx_upstream_check_peer_t *peer)
     return NGX_OK;
 }
 
-ngx_int_t
+static ngx_int_t
 ngx_http_upstream_check_http_parse(ngx_upstream_check_peer_t *peer)
 {
     ngx_int_t                            rc;
@@ -1457,7 +1457,7 @@ ngx_http_upstream_check_http_parse(ngx_upstream_check_peer_t *peer)
         *ctx->status.end = '\0';
         u_char * content_len_start = (u_char *)ngx_strstr(ctx->status.start, "Content-Length:");
         u_char * content_len_end = NULL;
-        ngx_uint_t found_body_len, body_len = 0;
+        ngx_uint_t found_body_len = 0, body_len = 0;
         if (content_len_start != NULL) {
             content_len_end = ngx_strlchr(content_len_start, ctx->status.end, '\r');
             if (content_len_end != NULL) {
