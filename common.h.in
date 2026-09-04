@@ -56,6 +56,10 @@ struct ngx_upstream_check_srv_conf_s {
     ngx_regex_t                             *expect_body_regex;
     ngx_array_t                             *fastcgi_params; //only for http module.
     ngx_uint_t                               default_down;
+
+    /* per-upstream SSL context for stream HTTPS checks */
+    ngx_ssl_t                               *ssl;
+    ngx_uint_t                               ssl_inited;
 };
 
 typedef struct {

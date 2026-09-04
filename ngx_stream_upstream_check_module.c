@@ -353,7 +353,7 @@ static ngx_check_conf_t  ngx_check_types[] = {
                 0 },
         { NGX_CHECK_TYPE_HTTP,
                 ngx_string("http"),
-                ngx_string("GET / HTTP/1.0\r\n\r\n"),
+                ngx_string("GET / HTTP/1.1\r\n\r\n"),
                 NGX_CONF_BITMASK_SET | NGX_CHECK_HTTP_2XX | NGX_CHECK_HTTP_3XX,
                 ngx_stream_upstream_check_send_handler,
                 ngx_stream_upstream_check_recv_handler,
@@ -364,7 +364,7 @@ static ngx_check_conf_t  ngx_check_types[] = {
                 1 },
         { NGX_CHECK_TYPE_HTTPS,
                 ngx_string("https"),
-                ngx_string("GET / HTTP/1.0\r\n\r\n"),
+                ngx_string("GET / HTTP/1.1\r\n\r\n"),
                 NGX_CONF_BITMASK_SET | NGX_CHECK_HTTP_2XX | NGX_CHECK_HTTP_3XX,
                 ngx_stream_upstream_check_send_handler,
                 ngx_stream_upstream_check_recv_handler,
@@ -781,6 +781,9 @@ ngx_stream_upstream_check_connect_handler(ngx_event_t *event)
         if ((rc = ngx_stream_upstream_check_peek_one_byte(c, peer)) == NGX_OK) {
             goto upstream_check_connect_done;
         } else {
+            ngx_log_error(NGX_LOG_NOTICE, event->log, 0, MODULE_NAME
+                   "[check-handler][when connect peer]"
+                   "check peek failed, close connection");
             ngx_close_connection(c);
             peer->pc.connection = NULL;
         }
@@ -814,7 +817,12 @@ ngx_stream_upstream_check_connect_handler(ngx_event_t *event)
     c->sendfile = 0;
     c->read->log = c->log;
     c->write->log = c->log;
-    c->pool = peer->pool;
+    // c->pool = peer->pool;
+    c->pool = ngx_create_pool(ngx_pagesize, peer->pc.log);
+    if (c->pool == NULL) {
+        ngx_stream_upstream_check_clean_event(peer);
+        return;
+    }
 
 upstream_check_connect_done:
     peer->state = NGX_HTTP_CHECK_CONNECT_DONE;
@@ -832,10 +840,6 @@ upstream_check_connect_done:
                    &peer->check_peer_addr->name, rc);
     /* The kqueue's loop interface needs it. */
     if (rc == NGX_OK) {
-        ngx_log_debug2(LOG_LEVEL, event->log, 0, MODULE_NAME
-                   "[check-handler][when connect tail peer]"
-                   "connect peer:(%V), rc: %ui", 
-                   &peer->check_peer_addr->name, rc);
         c->write->handler(c->write); //zhoucx: it is check_type->send_handler.
     }
 }
@@ -858,28 +862,24 @@ ngx_stream_upstream_check_ssl_connect_handler(ngx_event_t *event)
                    &peer->check_peer_addr->name);
 
     if (!c->ssl) {
-        ngx_ssl_t *ssl;
-        /* Create SSL context */
-        ssl = ngx_pcalloc(peer->pool, sizeof(ngx_ssl_t));
-        if (ssl == NULL) {
-            ngx_stream_upstream_check_status_update(peer, 0);
-            ngx_stream_upstream_check_clean_event(peer);
-            return;
+        if (!ucscf->ssl_inited) {
+            ngx_log_debug(LOG_LEVEL, event->log, 0, MODULE_NAME
+                   "[check-handler][when ssl connect peer] init ssl");
+            /* allocate per-upstream SSL context holder when using pointer field */
+            ucscf->ssl = ngx_pcalloc(peer->pool, sizeof(ngx_ssl_t));
+            //ucscf->ssl->log = c->log;
+            if (ngx_ssl_create(ucscf->ssl, NGX_SSL_TLSv1_2, NULL) != NGX_OK) {
+                ngx_stream_upstream_check_status_update(peer, 0);
+                ngx_stream_upstream_check_clean_event(peer);
+                return;
+            }
+            SSL_CTX_set_verify(ucscf->ssl->ctx, SSL_VERIFY_NONE, NULL);
+            SSL_CTX_set_verify_depth(ucscf->ssl->ctx, 0);
+            ucscf->ssl_inited = 1;
         }
-        ssl->log = c->log;
-        /* Initialize SSL context */
-        if (ngx_ssl_create(ssl, NGX_SSL_TLSv1_2, NULL) != NGX_OK) {
-            ngx_stream_upstream_check_status_update(peer, 0);
-            ngx_stream_upstream_check_clean_event(peer);
-            return;
-        }
-
-        /* Disable certificate verification */
-        SSL_CTX_set_verify(ssl->ctx, SSL_VERIFY_NONE, NULL);
-        SSL_CTX_set_verify_depth(ssl->ctx, 0);
 
         /* Create SSL connection */
-        rc = ngx_ssl_create_connection(ssl, c, NGX_SSL_BUFFER);
+        rc = ngx_ssl_create_connection(ucscf->ssl, c, NGX_SSL_BUFFER|NGX_SSL_CLIENT);
         if (rc != NGX_OK) {
             ngx_stream_upstream_check_status_update(peer, 0);
             ngx_stream_upstream_check_clean_event(peer);
@@ -887,7 +887,7 @@ ngx_stream_upstream_check_ssl_connect_handler(ngx_event_t *event)
         }
 
         /* Set SSL to client mode */
-        SSL_set_connect_state(c->ssl->connection);
+        //SSL_set_connect_state(c->ssl->connection);
         ngx_log_debug(LOG_LEVEL, c->log, 0, MODULE_NAME
                     "https init create ssl connection with peer: %V ",
                         &peer->check_peer_addr->name);
@@ -908,7 +908,7 @@ ngx_stream_upstream_check_ssl_connect_handler(ngx_event_t *event)
         c->ssl->handler = ngx_stream_upstream_check_ssl_handshake_handler;
         return;
     }
-    
+
     if (rc == NGX_ERROR) {
         ngx_log_error(NGX_LOG_ERR, c->log, 0, MODULE_NAME
                         "SSL handshake failed in handler for peer: %V",
@@ -917,14 +917,20 @@ ngx_stream_upstream_check_ssl_connect_handler(ngx_event_t *event)
         ngx_stream_upstream_check_clean_event(peer);
         return;
     }
-    ngx_log_debug2(LOG_LEVEL, c->log, 0, MODULE_NAME
-                    "SSL handshake completed in handler for peer: %V, rc: %ui",
-                    &peer->check_peer_addr->name, rc);
-    if (rc == NGX_OK) {
-        c->write->handler = peer->send_handler;
-        c->read->handler = peer->recv_handler;
-        c->write->handler(c->write); 
-    }
+
+    ngx_stream_upstream_check_ssl_handshake_handler(c);
+    // 一般不会进入这里
+    // ngx_log_debug2(LOG_LEVEL, c->log, 0, MODULE_NAME
+    //                 "SSL handshake completed in handler for peer: %V, rc: %ui",
+    //                 &peer->check_peer_addr->name, rc);
+    // if (rc == NGX_OK) {
+    //     c->write->handler = peer->send_handler;
+    //     c->read->handler = peer->recv_handler;
+    //     if (c->write->timer_set) {
+    //         ngx_del_timer(c->write);
+    //     }
+    //     c->write->handler(c->write); 
+    // }
 }
 
 static void
@@ -933,6 +939,11 @@ ngx_stream_upstream_check_ssl_handshake_handler(ngx_connection_t *c)
     if (c->ssl->handshaked) {
         c->write->handler = ngx_stream_upstream_check_send_handler;
         c->read->handler = ngx_stream_upstream_check_recv_handler;
+        ngx_log_debug(LOG_LEVEL, c->log, 0, MODULE_NAME
+                    "SSL handshake completed in handler");
+        if (c->write->timer_set) {
+            ngx_del_timer(c->write);
+        }
         c->write->handler(c->write); 
     }
 }   
@@ -1509,7 +1520,11 @@ ngx_stream_upstream_check_status_update(ngx_upstream_check_peer_t *peer,
     ucscf = peer->conf;
 
     if (result) { //up
-        peer->shm->rise_count++;
+        if(peer->shm->rise_count < (ngx_uint_t)-1) {
+            peer->shm->rise_count++;
+        }else{
+            peer->shm->rise_count = ucscf->rise_count;
+        }
         peer->shm->fall_count = 0;
         if (peer->shm->down && peer->shm->rise_count >= ucscf->rise_count) {
             peer->shm->down = 0;
@@ -1520,7 +1535,11 @@ ngx_stream_upstream_check_status_update(ngx_upstream_check_peer_t *peer,
         }
     } else {
         peer->shm->rise_count = 0;
-        peer->shm->fall_count++;
+        if(peer->shm->fall_count < (ngx_uint_t)-1) {
+            peer->shm->fall_count++;
+        }else{
+            peer->shm->fall_count = ucscf->fall_count;
+        } 
         if (!peer->shm->down && peer->shm->fall_count >= ucscf->fall_count) {
             peer->shm->down = 1;
             ngx_log_error(NGX_LOG_NOTICE, ngx_cycle->log, 0, MODULE_NAME
@@ -1553,11 +1572,35 @@ ngx_stream_upstream_check_clean_event(ngx_upstream_check_peer_t *peer)
             cf->need_keepalive &&
             (c->requests < ucscf->check_keepalive_requests))
         {
+            ngx_log_debug2(LOG_LEVEL, c->log, 0, MODULE_NAME
+                       "check clean event keepalive: index:%i, fd: %d",
+                       peer->index, c->fd);
             c->write->handler = ngx_stream_upstream_check_dummy_handler;
             c->read->handler = ngx_stream_upstream_check_discard_handler;
         } else {
+            /* 关闭连接时确保清理SSL资源 */
+            if (c->ssl) {
+                c->ssl->no_wait_shutdown = 1;
+                if (ngx_ssl_shutdown(c) == NGX_AGAIN) {
+                    SSL_free(c->ssl->connection);
+                    c->ssl = NULL;
+                    c->recv = ngx_recv;
+                }
+            }
+
+            ngx_pool_t *pool = c->pool;
             ngx_close_connection(c);
             peer->pc.connection = NULL;
+            if (pool) {
+                ngx_destroy_pool(pool);
+            }
+            if (peer->check_data) {
+                ngx_stream_upstream_check_ctx_t *ctx = peer->check_data;
+                ctx->recv.start = NULL;
+                ctx->recv.pos = NULL;
+                ctx->recv.last = NULL;
+                ctx->recv.end = NULL;
+            }
         }
     }
 
@@ -1568,6 +1611,8 @@ ngx_stream_upstream_check_clean_event(ngx_upstream_check_peer_t *peer)
     peer->state = NGX_HTTP_CHECK_ALL_DONE;
 
     if (peer->check_data != NULL && peer->reinit) {
+        ngx_log_debug(LOG_LEVEL, ngx_cycle->log, 0, MODULE_NAME
+                       "check clean event reinit");
         peer->reinit(peer);
     }
 
@@ -1633,7 +1678,6 @@ static void
 ngx_stream_upstream_check_clear_all_events()
 {
     ngx_uint_t                       i;
-    ngx_connection_t                *c;
     ngx_upstream_check_peer_t  *peer;
     ngx_upstream_check_peers_t *peers;
 
@@ -1661,9 +1705,16 @@ ngx_stream_upstream_check_clear_all_events()
             ngx_del_timer(&peer[i].check_timeout_ev);
         }
 
-        c = peer[i].pc.connection;
-        if (c) {
-            ngx_close_connection(c);
+        /* cleanup per-upstream SSL contexts (only once per upstream) */
+        if (peer[i].conf && peer[i].conf->ssl_inited) {
+            if (peer[i].conf->ssl) {
+                ngx_ssl_cleanup_ctx(peer[i].conf->ssl);
+            }
+            peer[i].conf->ssl_inited = 0;
+        }
+
+        if (peer[i].pc.connection) {
+            ngx_close_connection(peer[i].pc.connection);
             peer[i].pc.connection = NULL;
         }
 
@@ -2240,20 +2291,6 @@ ngx_stream_upstream_check_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data)
     }
 
     shpool = (ngx_slab_pool_t *) shm_zone->shm.addr;
-    // alloc peers_shm
-    size = sizeof(*peers_shm) +
-           (number ) * sizeof(ngx_upstream_check_peer_shm_t);//last item not use :)
-    peers_shm = ngx_slab_alloc(shpool, size);
-
-    if (peers_shm == NULL) {
-        goto failure;
-    }
-    ngx_memzero(peers_shm, size);
-
-    peers_shm->generation = ngx_stream_upstream_check_shm_generation;
-    peers_shm->checksum = peers->checksum;
-    peers_shm->number = number;
-    // end 
 
     if (data) {// ozone.data
         ngx_log_debug(LOG_LEVEL, shm_zone->shm.log, 0, MODULE_NAME
@@ -2292,8 +2329,21 @@ ngx_stream_upstream_check_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data)
             }
         }
 
+        size = sizeof(*peers_shm) +
+               (number) * sizeof(ngx_upstream_check_peer_shm_t);
+
+        peers_shm = ngx_slab_alloc(shpool, size);
+
+        if (peers_shm == NULL) {
+            goto failure;
+        }
+
+        ngx_memzero(peers_shm, size);
     }// if (!same) { 
 
+    peers_shm->generation = ngx_stream_upstream_check_shm_generation;
+    peers_shm->checksum = peers->checksum;
+    peers_shm->number = number;
 
     peer = peers->peers.elts;
 
@@ -2504,4 +2554,3 @@ ngx_stream_upstream_check_init_process(ngx_cycle_t *cycle)
 
     return ngx_stream_upstream_check_add_timers(cycle);
 }
-

@@ -344,7 +344,7 @@ static void *ngx_http_upstream_check_create_srv_conf(ngx_conf_t *cf);
 static char *ngx_http_upstream_check_init_srv_conf(ngx_conf_t *cf, void *conf);
 
 static void *ngx_http_upstream_check_create_loc_conf(ngx_conf_t *cf);
-static char * ngx_http_upstream_check_merge_loc_conf(ngx_conf_t *cf,
+static char *ngx_http_upstream_check_merge_loc_conf(ngx_conf_t *cf,
     void *parent, void *child);
 
 #define SHM_NAME_LEN 256
@@ -553,7 +553,7 @@ static ngx_check_conf_t  ngx_check_types[] = {
 
     { NGX_HTTP_CHECK_HTTP,
       ngx_string("http"),
-      ngx_string("GET / HTTP/1.0\r\n\r\n"),
+      ngx_string("GET / HTTP/1.1\r\n\r\n"),
       NGX_CONF_BITMASK_SET | NGX_CHECK_HTTP_2XX | NGX_CHECK_HTTP_3XX,
       ngx_http_upstream_check_send_handler,
       ngx_http_upstream_check_recv_handler,
@@ -2262,7 +2262,11 @@ ngx_http_upstream_check_status_update(ngx_upstream_check_peer_t *peer,
     ucscf = peer->conf;
 
     if (result) {
-        peer->shm->rise_count++;
+        if(peer->shm->rise_count < (ngx_uint_t)-1) {
+            peer->shm->rise_count++;
+        }else{
+            peer->shm->rise_count = ucscf->rise_count;
+        }
         peer->shm->fall_count = 0;
         if (peer->shm->down && peer->shm->rise_count >= ucscf->rise_count) {
             peer->shm->down = 0;
@@ -2273,7 +2277,11 @@ ngx_http_upstream_check_status_update(ngx_upstream_check_peer_t *peer,
         }
     } else {
         peer->shm->rise_count = 0;
-        peer->shm->fall_count++;
+        if(peer->shm->fall_count < (ngx_uint_t)-1) {
+            peer->shm->fall_count++;
+        }else{
+            peer->shm->fall_count = ucscf->fall_count;
+        } 
         if (!peer->shm->down && peer->shm->fall_count >= ucscf->fall_count) {
             peer->shm->down = 1;
             ngx_log_error(NGX_LOG_NOTICE, ngx_cycle->log, 0, MODULE_NAME
